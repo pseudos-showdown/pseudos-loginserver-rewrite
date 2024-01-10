@@ -4,18 +4,19 @@
  * By Mia
  * @author mia-pi-git
  */
-import {Config} from './config-loader';
 import {promises as fs, readFileSync} from 'fs';
+import * as pathModule from 'path';
+import * as crypto from 'crypto';
+import * as url from 'url';
+import {Config} from './config-loader';
 import {Ladder} from './ladder';
 import {Replays} from './replays';
 import {ActionError, QueryHandler, Server} from './server';
+import {Session} from './user';
 import {toID, updateserver, bash, time, escapeHTML} from './utils';
 import * as tables from './tables';
 import {SQL} from './database';
-import * as pathModule from 'path';
 import IPTools from './ip-tools';
-import * as crypto from 'crypto';
-import * as url from 'url';
 
 const OAUTH_TOKEN_TIME = 2 * 7 * 24 * 60 * 60 * 1000;
 
@@ -171,42 +172,64 @@ export const actions: {[k: string]: QueryHandler} = {
 		throw new ActionError("Malformed request", 400);
 	},
 
-	async prepreplay(params) {
+	async addreplay(params) {
+		// required params:
+		//   id, format, log, players
+		// optional params:
+		//   inputlog, hidden, password
+
 		const server = await this.getServer(true);
 		if (!server) {
 			// legacy error
 			return {errorip: this.getIp()};
 		}
 
+		// the server must send all the required values
+		if (!params.id || !params.format || !params.log || !params.players) {
+			throw new ActionError("Required params: id, format, log, players", 400);
+		}
+		// player usernames cannot be longer than 18 characters
+		if (params.players.split(',').some(p => p.length > 18)) {
+			throw new ActionError("Player names must be 18 chars or shorter", 400);
+		}
+		// the battle ID must be valid
+		// the format from the battle ID must match the format ID
 		const extractedFormatId = /^([a-z0-9]+)-[0-9]+$/.exec(`${params.id}`)?.[1];
-		const formatId = /^([a-z0-9]+)$/.exec(`${params.format}`)?.[1];
-		if (
-			// the server must send all the required values
-			!params.id || !params.format || !params.loghash || !params.p1 || !params.p2 ||
-			// player usernames cannot be longer than 18 characters
-			params.p1.length > 18 || params.p2.length > 18 ||
-			// the battle ID must be valid
-			!extractedFormatId ||
-			// the format from the battle ID must match the format ID
-			formatId !== extractedFormatId
-		) {
-			return 0;
+		const formatId = toID(params.format);
+		if (!extractedFormatId || formatId !== extractedFormatId) {
+			throw new ActionError("Format ID must match the one in the replay ID", 400);
 		}
 
 		if (server.id !== Config.mainserver) {
 			params.id = server.id + '-' + params.id;
 		}
-		params.serverid = server.id;
 
-		const result = await Replays.prep(params);
+		const id = ('' + params.id).toLowerCase().replace(/[^a-z0-9-]+/g, '');
+		let isPrivate: 0 | 1 | 2 = params.hidden ? 1 : 0;
+		if (params.hidden === '2') isPrivate = 2;
+		const players = params.players.split(',').map(p => Session.wordfilter(p));
+		const out = await Replays.add({
+			id,
+			log: params.log,
+			players,
+			format: params.format,
+			uploadtime: time(),
+			rating: null,
+			inputlog: params.inputlog || null,
+			private: isPrivate,
+			password: params.password || null,
+		});
 
 		this.setPrefix(''); // No need for prefix since only usable by server.
-		return result;
+		return {replayid: out};
 	},
 
-	uploadreplay(params) {
-		this.setHeader('Content-Type', 'text/plain; charset=utf-8');
-		return Replays.upload(params, this);
+	prepreplay() {
+		throw new ActionError("No longer exists; use addreplay.", 410);
+	},
+
+	uploadreplay() {
+		throw new ActionError("No longer exists; use addreplay.", 410);
 	},
 
 	async invalidatecss() {
@@ -369,7 +392,7 @@ export const actions: {[k: string]: QueryHandler} = {
 			if (update[0]) throw new Error(update.join(','));
 			update = true;
 		} catch (e: any) {
-			throw new ActionError(e.message);
+			throw new ActionError(e.message as string);
 		}
 		update = await bash(
 			`sudo -u www-data node build${params.full ? ' full' : ''}`, Config.clientpath
@@ -441,7 +464,7 @@ export const actions: {[k: string]: QueryHandler} = {
 		if (!actor) {
 			throw new ActionError("The staff executing this action must be specified.");
 		}
-		if (!params.reason || !params.reason.length) {
+		if (!params.reason?.length) {
 			throw new ActionError("A reason must be specified.");
 		}
 		const standing = Number(params.standing);
@@ -478,7 +501,7 @@ export const actions: {[k: string]: QueryHandler} = {
 		if (!actor) {
 			throw new ActionError("The staff executing this action must be specified.");
 		}
-		if (!params.reason || !params.reason.length) {
+		if (!params.reason?.length) {
 			throw new ActionError("A reason must be specified.");
 		}
 		const standing = Number(params.standing);
@@ -706,7 +729,7 @@ export const actions: {[k: string]: QueryHandler} = {
 			throw new ActionError("Failed to fetch team. Please try again later.");
 		}
 	},
-	async 'replays/recent'() {
+	'replays/recent'() {
 		this.allowCORS();
 		return Replays.recent();
 	},
@@ -715,18 +738,62 @@ export const actions: {[k: string]: QueryHandler} = {
 		if (params.sort && params.sort !== 'rating' && params.sort !== 'date') {
 			throw new ActionError('Sort must be "rating" or "date"');
 		}
-		const search = {
-			username: toID(params.username || params.user),
-			username2: toID(params.username2),
-			format: toID(params.format),
-			page: Number(params.page || '1'),
-			byRating: params.sort === 'rating',
-		};
-		if (isNaN(search.page) || search.page !== Math.trunc(search.page) || search.page < 0) {
+		const usernames = [
+			...(params.username || params.user || '').split(','),
+			...(params.username2 || params.user2 || '').split(','),
+		].map(toID).filter(Boolean);
+		if (usernames.length > 2) {
+			throw new ActionError(`Limit 2 usernames in a search`);
+		}
+		const page = Number(params.page || '1');
+		const before = Number(params.before) || undefined;
+		if (isNaN(page) || page !== Math.trunc(page) || page <= 0) {
 			throw new ActionError(`Invalid page number: ${params.page}`);
 		}
-		if (!search.page) search.page = 1;
+		if (params.page && before) {
+			throw new ActionError(`Cannot set both "page" and "before", please choose one method of pagination`);
+		}
+
+		const search = {
+			usernames: usernames,
+			format: toID(params.format),
+			page,
+			before,
+			byRating: params.sort === 'rating',
+		};
 		return Replays.search(search);
+	},
+	async 'replays/search.json'(params) {
+		this.allowCORS();
+		if (params.sort && params.sort !== 'rating' && params.sort !== 'date') {
+			throw new ActionError('Sort must be "rating" or "date"');
+		}
+		const usernames = [
+			...(params.username || params.user || '').split(','),
+			...(params.username2 || params.user2 || '').split(','),
+		].map(toID).filter(Boolean);
+		if (usernames.length > 2) {
+			throw new ActionError(`Limit 2 usernames in a search`);
+		}
+		const page = Number(params.page || '1');
+		const before = Number(params.before) || undefined;
+		if (isNaN(page) || page !== Math.trunc(page) || page <= 0) {
+			throw new ActionError(`Invalid page number: ${params.page}`);
+		}
+		if (params.page && before) {
+			throw new ActionError(`Cannot set both "page" and "before", please choose one method of pagination`);
+		}
+
+		const search = {
+			usernames: usernames,
+			format: toID(params.format),
+			page,
+			before,
+			byRating: params.sort === 'rating',
+		};
+		const results = await Replays.search(search);
+		this.response.setHeader('Content-Type', 'application/json');
+		return JSON.stringify(results);
 	},
 	async 'replays/searchprivate'(params) {
 		this.verifyCrossDomainRequest();
@@ -735,22 +802,32 @@ export const actions: {[k: string]: QueryHandler} = {
 		if (params.sort && params.sort !== 'rating' && params.sort !== 'date') {
 			throw new ActionError('Sort must be "rating" or "date"');
 		}
+		const usernames = [
+			...(params.username || params.user || '').split(','),
+			...(params.username2 || params.user2 || '').split(','),
+		].map(toID).filter(Boolean);
+		if (usernames.length > 2) {
+			throw new ActionError(`Limit 2 usernames in a search`);
+		}
+		const page = Number(params.page || '1');
+		const before = Number(params.before) || null;
+		if (isNaN(page) || page !== Math.trunc(page) || page <= 0) {
+			throw new ActionError(`Invalid page number: ${params.page}`);
+		}
+		if (params.page && before) {
+			throw new ActionError(`Cannot set both "page" and "before", please choose one method of pagination`);
+		}
+		if (!(this.user.isSysop() || usernames.includes(this.user.id))) {
+			throw new ActionError(`Access denied: You must be logged in as a username you're searching for.`);
+		}
+
 		const search = {
-			username: toID(params.username || params.user),
-			username2: toID(params.username2),
+			usernames,
 			format: toID(params.format),
-			page: Number(params.page || '1'),
+			page,
 			byRating: params.sort === 'rating',
 			isPrivate: true,
 		};
-
-		if (!(this.user.isSysop() || [search.username, search.username2].includes(this.user.id))) {
-			throw new ActionError(`Access denied: You must be logged in as a username you're searching for.`);
-		}
-		if (isNaN(search.page) || search.page !== Math.trunc(search.page) || search.page < 0) {
-			throw new ActionError(`Invalid page number: ${params.page}`);
-		}
-		if (!search.page) search.page = 1;
 		return Replays.search(search);
 	},
 	async 'replays/edit'(params) {
